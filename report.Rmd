@@ -1,0 +1,598 @@
+---
+title: "NeMak's Opportunistic Chaos:"
+subtitle: "A Movie Recommendation Model"
+author: "Neal Maker"
+date: "February 19, 2019"
+output: 
+  pdf_document:
+    fig_caption: true
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+```{r wrangle, echo=FALSE}
+#############################################################
+# Create edx set, validation set, and submission file
+#############################################################
+
+# Note: this process could take a couple of minutes
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(knitr)) install.packages("knitr", repos = "http://cran.us.r-project.org")
+if(!require(tufte)) install.packages("tufte", repos = "http://cran.us.r-project.org")
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- read.table(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                      col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+
+set.seed(1)
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+>"We are not here to curse the darkness, but to light the candle that can guide us thru that darkness to a safe and sane [movie choice]."
+>
+> `r tufte::quote_footer('--- John F. Kennedy')`
+
+
+#Introduction
+
+As William Cowper famously wrote in 1785, "[Movies are] the very spice of life, that gives it all its flavour."^[Quoted passages in this document are subject to the author's interpretation and may not be entirely accurate.] Yet we cannot deny the fact that a poor movie choice can ruin even the best-made plans. With today's great proliferation of films, ranging from the sublime to the downright nauseating, choosing a worthwhile movie can be a confusing and ruinous affair. It it therefore imperative that we, as citizens of this visually-stimulated world, bring all our technological prowess to bear on the problem of movie recommendation. We have the tools. We have the giant datasets. As Churchill intoned, "Let us therefore brace ourselves to our duties, and so bear ourselves that, if the [cinema] last for a thousand years, men will still say: ‘This was their finest hour."
+
+We are fortunate to have at our disposal a vast and freely available collection of movie ratings that was assembled by the GroupLens research lab in the Department of Computer Science and Engineering at the University of Minnesota, Twin Cities.^[F. Maxwell Harper and Joseph A. Konstan. 2015. The MovieLens Datasets: History and Context. ACM Transactions on Interactive Intelligent Systems (TiiS) 5, 4, Article 19 (December 2015), 19 pages. DOI=http://dx.doi.org/10.1145/2827872] GroupLens hosts a free, online, personalized movie recommendation tool that uses the collection; and maintains several stable benchmark datasets of different sizes, for use by researchers and students (count me the latter). In response to an assignment for the capstone course of HarvardX's Data Science series,^[HarvardX is an initiative of Harvard University. Their Data Science series is taught by professor Rafael Irizarry and is available at https://online-learning.harvard.edu/series/professional-certificate-data-science] and for the betterment of humanity, I have taken up their 10M dataset and with it forged a rough path through the wilderness of not-yet-watched films, that viewers might not wander in vain. 
+
+The 10M MovieLens dataset contains 10,000,054 ratings of 10,681 individual movies by 71,567 different viewers, along with information about a number of useful attributes related to each rating and movie. It also contains more than 90,000 tags that viewers applied to individual movies, although they were not used in this analysis. A script written by faculty and staff at HarvardX was used to download and preprocess the MovieLens data, to facilitate the analysis. In part, it divided the data into working and validation sets, so that students can train algorithms on the working set and later be evaluated based on predictions they obtain for the validation set. The working set, which was used in this project, contains 9,000,055 ratings applied to 10,677 movies by 69,878 unique viewers, along with information about movie genres and the dates and times recommendations were made. The HarvardX script and all of the subsequent analysis were written for the statistical computing environment R.^[The R Foundation: https://www.r-project.org/]  
+
+To achieve the noble goal of building a movie recommendation system based on the movies and viewers in the MovieLens dataset, I followed a classic, cyclical data science process.^[Interested readers may consult Garrett Grolemund and Hadley Wickham's *R for Data Science* (2017), published by O’Reilly: https://r4ds.had.co.nz/ or Roger Peng and Elizabeth Matsui's *The Art of Data Science* (2018), published by Leanpub: https://leanpub.com/artofdatascience] After importing and tidying the data with the tool created by HarvardX, and refining my question based on the data, I performed exploratory data analysis with ample use of visualization and built and refined a machine learning algorithm, in an iterative process, to predict movie ratings as accurately as possible.  
+
+#Analysis
+
+To begin the analysis, I reserved 30 percent of the working dataset to test the final algorithm. This test set was not used in any of the exploratory data analysis or algorithm building, so that a good estimate of overall accuracy (unencumbered by overfitting) could be made. I placed the remaining 70 percent of the data in a training set for use in data exploration and algorithm creation.
+
+```{r partition, echo=FALSE}
+set.seed(1)
+partition_index <- createDataPartition(edx$rating, times = 1, p = .3, list = FALSE)
+train_set <- edx[-partition_index,]
+temp <- edx[partition_index,]
+
+#make sure userId and movieId in test_set are also in train_set
+test_set <- temp %>% 
+  semi_join(train_set, by = "movieId") %>%
+  semi_join(train_set, by = "userId")
+
+# Add rows removed from test_set back into train_set
+removed <- anti_join(temp, test_set)
+train_set <- rbind(train_set, removed)
+
+rm(partition_index, temp, removed)
+```
+
+```{r subpartition}
+set.seed(1)
+sub_index <- createDataPartition(train_set$rating, times = 1, p = .1, list = FALSE)
+train_sub <- train_set[sub_index,]
+
+rm(sub_index)
+```
+
+The training set was still awkwardly large for my small computer, so I created a randomly selected subset of ten percent of the training data to speed the creation of exploratory visualizations. This subset contains `r nrow(train_sub)` recommendations: large enough to show patterns in the data, but small enough to keep computation times down. When it came to training the algorithm, I used the full training set to reduce the loss; and once a reasonable estimate of the final algorithm's loss was obtained with the test set, I retrained the algorithm using the entire working set (the test set and the training set combined), to further minimize the loss.
+
+##Understanding the Ratings
+
+The dataset contains ratings made from 1996 to 2009. Ratings range from 0.5 to 5 stars in half-star increments, but only whole-star ratings were given prior to 2003, when half-stars were apparently invented. Because of the early lack of half-stars, whole-star ratings are much more common in the data overall, though half-stars were just as popular as whole-stars once they hit the scene (Figure 1). The most common rating, before and after the half-star revolution, is 4 stars. The overall mean rating is lower, at `r round(mean(train_set$rating), 2)` stars, which speaks to the fact that the ratings have a somewhat skewed distribution.
+
+```{r ratingHist, fig.cap="Frequency of different ratings overall (left) and after the introduction of half-star ratings (right). Vertical black lines show mean ratings.", fig.align= 'center', fig.show='hold', out.width='49%'}
+#when did half star ratings begin?
+half_star_shift <- train_set %>% 
+  filter(rating %in% c(.5, 1.5, 2.5, 3.5, 4.5)) %>%
+  arrange(timestamp) %>% 
+  summarize(shift = min(timestamp)) %>% .$shift
+
+train_sub %>%
+  ggplot(aes(rating)) + 
+  geom_histogram(binwidth = .5, fill = "dark green") +
+  geom_vline(aes(xintercept = mean(rating)), size = 1) +
+  scale_x_continuous(limits = c(0, 5.5), 
+                     breaks = 1:5,
+                     minor_breaks = seq(.5, 5, .5))
+
+train_sub %>% 
+  filter(timestamp > half_star_shift) %>%
+  ggplot(aes(rating)) + 
+  geom_histogram(binwidth = .5, fill = "dark green") +
+  geom_vline(aes(xintercept = mean(rating)), size = 1) +
+  scale_x_continuous(limits = c(0, 5.5), 
+                     breaks = 1:5,
+                     minor_breaks = seq(.5, 5, .5))
+```
+
+Also of note, the mean rating has been quite stable through time, indicating that the rating date is a poor predictor of actual ratings (Figure 2). There is no evidence that the half-star revolution affected the average rating at all.
+
+```{r ratings, fig.cap="Ratings through time. Individual ratings are displayed with random vertical offset and partial transparency so that their relative concentration can be visualized. Darker areas show a greater concentration of ratings. The green line is the mean rating trend as estimated with a generalized additive model.", fig.height=4}
+
+train_sub %>% 
+  mutate(year = 1970 + timestamp/60/60/24/365) %>%
+  ggplot(aes(year, rating)) +
+  geom_jitter(width = 0, alpha = .006) +
+  geom_smooth(col = "dark green", size = 1.5) +
+  scale_y_continuous(limits = c(0,5.5), breaks = 1:5) +
+  scale_x_continuous(limits = c(1995, 2010), 
+                     breaks = seq(1995, 2010, 5),
+                     minor_breaks = 1996:2010) +
+  theme(axis.title.x = element_blank())
+```
+
+Another thing that did not affect the average rating was the total number of ratings made in each month (the *rating rate*). The rating rate fluctuated greatly throughout the thirteen years represented, and especially so in the lawless early years, when whole-stars reigned unchecked (Figure 3).
+
+```{r TimestampHist, fig.cap="Number of ratings per month, accross all movies and viewers.", fig.height=2}
+train_sub %>% mutate(year = 1970 + timestamp/60/60/24/365) %>%
+  ggplot(aes(year)) + 
+  geom_histogram(binwidth = 1/12, fill = "dark green") +
+  scale_x_continuous(limits = c(1995, 2010), 
+                     breaks = seq(1995, 2010, 5),
+                     minor_breaks = 1995:2010) +
+  theme(axis.title.x = element_blank())
+```
+
+As could be expected, most viewers and movies are associated with a only a couple dozen ratings at most, but there are a small number of enthusiastic viewers who rated hundreds of movies and a small number of popular movies that were rated by thousands of viewers (Figure 4). A similar pattern is seen with genres, although their interpretation is more complex. Genres will be discussed in more detail later.
+
+```{r userMovieHists, fig.cap="Frequencies of viewers (left) and movies (right) based on the number of ratings associated with them.", fig.align= 'center', fig.show='hold', out.width='49%'}
+#histogram of users
+train_sub %>% 
+  group_by(userId) %>%
+  summarize(n = n()) %>%
+  ggplot(aes(n)) + 
+  geom_histogram(fill = "dark green") +
+  scale_x_continuous(trans = "log10", name = "number of reviews per viewer") +
+  scale_y_continuous(name = "number of viewers")
+
+#histogram of movies
+train_sub %>% 
+  group_by(movieId) %>%
+  summarize(n = n()) %>%
+  ggplot(aes(n)) + 
+  geom_histogram(fill = "dark green") +
+  scale_x_continuous(trans = "log10", name = "number of reviews per movie") +
+  scale_y_continuous(name = "number of movies")
+```
+
+##Building the Algorithm
+
+Ratings are a discrete numeric outcome, so they can be predicted using regression or classification. For this analysis I took a regression approach and allowed my predictions to be made along a continuous scale. For example, I allowed my algorithm to predict 3.8765 stars even though viewers only ever give whole- or half-star ratings. I trained it to minimize the root means squared error (RMSE) of its predictions, so that it would predict ratings as close as possible to the true ratings, and I assessed its final efficacy based on RMSE.
+
+I used an approach similar to, but much simpler than, the one used in the "BellKor's Pragmatic Chaos" solution to the 2009 Netflix Grand Prize^[See Yehuda Koren's 2009 paper *The BellKor Solution to the Netflix Grand Prize*: https://www.netflixprize.com/assets/GrandPrize2009_BPC_BellKor.pdf] (hence the "opportunistic chaos" of my title). As a starting place, the model predicts the mean overall rating in the data ($\mu$). Then, residual ratings are decomposed into separate, non-interacting genre ($b_{g}$), movie ($b_{m}$) and viewer ($b_{v}$) effects using Naive Bayes classifiers. Temporal effects are accounted for (also using Naive Bayes classifiers) that explain changing average ratings for individual movies ($b_{m,Bin(t)}$) and viewers ($b_{v,Bin(t)}$) through time separately. Taken together, all these effects establish baseline predictions independent of viewer preferences. I intended to add viewer-movie interactions to the model to modify baseline predictions according to the preferences of individual viewers, but I was unable to improve the model's predictions with them, so I left them out. The final model can be expressed as: 
+
+$$Y_{m,v}=\mu+b_{g}+b_{m}+b_{v}+b_{m,Bin(t)}+b_{v,Bin(t)}+\epsilon_{m,v}$$
+
+While chaotic and multi-faceted, this approach recognizes that there are independent movie and viewer effects. (Some movies are just bad, and some viewers will see them through rose-colored glasses nonetheless.) It isolates those simple baseline effects from the more complex interactions, hypothetically allowing the interactions to be modeled more precisely. In this case, the baseline effects were sufficient without the addition of viewer-movie interactions.
+
+###Movie and Viewer Effects
+
+Effects related to individual movies and viewers were modeled by grouping ratings by movie or viewer and calculating each group's average deviation from the overall mean $\mu$. They account for the average popularity of each movie and the average positivity of each viewer, respectively. 
+
+###Exploring a Genre Effect
+
+An effect related to the popularity of individual genres is a type of movie effect, as genres are descriptors of movies. I was unsure if a genre effect was useful, or if it was redundant to the individual movie effect described above, and therefore incapable of describing further variation in ratings. I ended up exploring the genre effect and including it in the final model even though it does relatively little to reduce the loss (parsimony be damned).
+
+Because any given movie can belong to multiple genres, a genre effect can be structured in one of two principal ways. The effect of each individual genre can be calculated, in which case the influence of genre on each movie's ratings would be the average of the influences of all the genres to which it belongs; or a concatenated genre effect can be calculated, in which each combination of genres is seen as a distinct genre in its own right (for example, 'crime|action' is one genre, and 'crime|action|adventure' is another).
+
+The concatenated genre effect appears to be the more useful, and was chosen for the final model. There is much more variation in average ratings between concatenated genres (Figure 5) than between individual genres (Figure 6). Notice, for example that the median ratings for 'Adventure', 'Animation', 'Children', 'Fantasy', and 'Sci-fi' genres individually are all at least 3.5 stars, while the median rating for the concatenated 'Adventure|Animation|Children|Fantasy|Sci-fi' genre is only 2 stars. Combining individual genre effects could never capture the bad chemistry that comes from combining all those genres!
+
+```{r concatGenres, fig.cap="Distributions of ratings within 60 randomly selected, concatinated genres.", fig.height=5.4}
+#df of concatinated genres
+genres <- train_sub %>% group_by(genres) %>% summarize(n = n(), mean_rat = mean(rating)) %>%
+  filter(n>50)
+
+#sample combined genres for visualization
+set.seed(3)
+genre_samp <- sample(genres$genres, 60)
+
+#rating boxplots for sampled combined genres
+train_sub %>% filter(genres %in% genre_samp) %>%
+  mutate(genres = reorder(genres, rating, mean)) %>%
+  ggplot(aes(genres, rating, col = genres)) +
+  geom_boxplot(col = "dark green") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), 
+        axis.title.x = element_blank(),
+        legend.position = "none") 
+```
+
+```{r indGenres, fig.cap="Distributions of ratings within individual, non-concatenated genres. Movies that belong to multiple genres are represented in multiple distributions.", fig.height=3, fig.width=5}
+#selection of individual genres
+genres_simp <- c("Action", "Adventure", "Animation", "Children", "Comedy", 
+                 "Crime", "Documentary", "Drama", "Fantasy", "Film-Noir", 
+                 "Horror", "IMAX", "Musical", "Mystery", "Romance", "Sci-Fi", 
+                 "Thriller", "War", "Western") 
+
+#df of ratings sorted into individual genres & replicated as needed
+temp <- map(genres_simp, function(x){
+  train_sub %>% filter(str_detect(genres, x)) %>%
+    mutate(genres = x)
+})
+
+train_single_genres <- rbind(temp[[1]], temp[[2]], temp[[3]], temp[[4]],
+                             temp[[5]], temp[[6]], temp[[7]], temp[[8]],
+                             temp[[9]], temp[[10]], temp[[11]], temp[[12]],
+                             temp[[13]], temp[[14]], temp[[15]], temp[[16]])
+
+#rating boxplots for individual genres
+train_single_genres %>%
+  mutate(genres = reorder(genres, rating, mean)) %>%
+  ggplot(aes(genres, rating)) +
+  geom_boxplot(col = "dark green") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), 
+        axis.title.x = element_blank(),
+        legend.position = "none")
+```
+
+###Evidence for Temporal Effects
+
+We have already seen that the overall average rating does not vary appreciably through time, but Figure 7 demonstrates that individual movies' average ratings do sometimes change through time in a meaningful way. For example, average ratings for *Crash* rose through the rating period from approximately 2.5 stars to approximately 4 stars, while the movie *Eye For An Eye* saw its average ratings fall a similar amount. 
+
+```{r  movieTime, fig.cap="Ratings through time for a random selection of movies. Linear regression is used to estimate trends (in green).", fig.height=8}
+set.seed(20)
+train_sub %>%
+  mutate(year = 1970 + timestamp/60/60/24/365) %>%
+  filter(movieId %in% sample(unique(movieId), 28, replace = FALSE)) %>%
+  ggplot(aes(year, rating)) +
+  geom_point(alpha = .3) +
+  geom_smooth(method = "lm", col = "dark green") +
+  scale_y_continuous(limits = c(0, 5.5)) +
+  facet_wrap(~ title, ncol = 4)
+```
+
+Viewers' average ratings (Figure 8) can change in a similar fashion (notice Viewer # 20709), though the changes are sometimes harder to see because many viewers engage in *batch rating*, in which they rate bunches of movies on the same day (take Viewer # 49531, for example).
+
+```{r userTime, fig.cap="Ratings through time for a random selection of viewers who have rated at least 30 movies. Linear regression is used to estimate trends (in green).", fig.height=7}
+set.seed(10)
+train_sub %>%
+  mutate(year = 1970 + timestamp/60/60/24/365) %>%
+  group_by(userId) %>%
+  filter(n()>=30) %>%
+  ungroup() %>%
+  filter(userId %in% sample(unique(userId), 30, replace = FALSE)) %>%
+  ggplot(aes(year, rating)) +
+  geom_point(alpha = .3) +
+  geom_smooth(method = "lm", col = "dark green") +
+  scale_y_continuous(limits = c(0, 5.5)) +
+  facet_wrap(~ userId, ncol = 5)
+```
+
+Overall, temporal effects are not important for many viewers and movies; because many are associated with too few ratings for a temporal effect to reveal itself, and because many that are associated with more ratings don't show a strong time correlation (like the movies *Higher Learning* and *Herbie Goes Bananas*).  Still, for a minority of movies and viewers, temporal effects do explain some of the rating variation, and they are worth including in the model.
+
+I included them separately from the individual viewer and movie effects, following the lead of the BellKor team.  For the sake of computational efficiency, I used a Naive Bayes approach: grouping timestamps into 20 equally-sized bins and calculating average ratings' deviation from the mean for each bin for each movie or viewer. Linear regression probably would have decreased the RMSE somewhat, but it would have been much more memory intensive.
+
+###Regularization
+
+It is clear from Figures 7 and 8 that temporal effects can force unrealistic predictions for some movies or viewers in time periods that contain only a few ratings. When a time period only has one rating that happens to be abnormally high or low, any predictions made for that period will also end up abnormally high or low. 
+
+The same phenomenon can be seen with the genre effect, the movie effect and the viewer effect. Genres, movies, and viewers associated with only a small number of ratings are far more likely to have uncharacteristically low or high average ratings (Figure 9). For example, there are `r nrow(train_set %>% group_by(movieId) %>% summarize(mean_rat = mean(rating), n = n()) %>% arrange(desc(mean_rat)) %>% filter(mean_rat<.75|mean_rat>4.75))` movies in the training set with mean ratings lower than 0.75 or higher than 4.75, and none of them were rated by more than 4 viewers.
+
+```{r regularization, fig.cap="Number of ratings vs. mean rating for genres, movies, and viewers. Points are displayed with random vertical and horizontal offset and partial transparency so that their relative concentration can be visualized.", fig.align='center', fig.show='hold', out.width='60%'}
+#number ratings vs mean rating for concatinated genres
+train_sub %>% group_by(genres) %>% summarize(mean_rat = mean(rating), n = n()) %>%
+  arrange(desc(mean_rat)) %>% 
+  ggplot(aes(n, mean_rat)) + 
+  geom_jitter(alpha = .4, height = .5, width = .5) +
+  scale_x_continuous(trans = "log", 
+                     breaks = c(1, 10, 100, 1000, 1e4, 1e5, 1e6)) +
+  scale_y_continuous(name = " ") +
+  theme(axis.title.x = element_blank()) +
+  ggtitle("Concatinated Genres")
+
+#number ratings vs mean rating for individual movies
+train_sub %>% group_by(movieId) %>% summarize(mean_rat = mean(rating), n = n()) %>%
+  arrange(desc(mean_rat)) %>% 
+  ggplot(aes(n, mean_rat)) + 
+  geom_jitter(alpha = .2, height = .5, width = .5) +
+  scale_x_continuous(trans = "log", 
+                     breaks = c(1, 10, 100, 1000, 10000)) +
+  scale_y_continuous(name = "mean rating") +
+  theme(axis.title.x = element_blank()) +
+  ggtitle("Movies")
+
+#number ratings vs mean rating for individual viewers
+train_sub %>% group_by(userId) %>% summarize(mean_rat = mean(rating), n = n()) %>%
+  arrange(desc(mean_rat)) %>% 
+  ggplot(aes(n, mean_rat)) + 
+  geom_jitter(alpha = .1, height = .5, width = .5) +
+  scale_x_continuous(name = "number of ratings", 
+                     trans = "log", 
+                     breaks = c(1, 10, 100, 1000, 10000)) +
+  scale_y_continuous(name = " ") +
+  ggtitle("Viewers")
+```
+
+Regularization was applied to all of the baseline effects, limiting the influence of effects that were trained on small samples by multiplying each term by $\frac{n}{n+\lambda}$, where $n$ is the sample size and $\lambda$ is a parameter that determines how large a penalty is imposed on small samples. Different parameters were used for each effect, and parameters were optimized by training them to the data using cross-validation.
+
+###Movie-Viewer Interactions
+
+Several different algorithms were explored for modeling movie-viewer interactions, including a k-nearest neighbors algorithm and a random forest algorithm. Their usefulness was limited on my computer because of their high memory use. In all but one case, the algorithms could only be fit to small subsets of the training data. I was able to fit a random forest algorithm to the entire training set, but, as with all the interactive models I tried, it only increased the RMSE. In the end, I omitted any movie-viewer interactions term from the final model. 
+
+#Results
+
+```{r train, echo=FALSE}
+#start with naive assumption (guess the mean)
+
+mu <- mean(train_set$rating)
+
+#add regularized genre specific effect with concatinated genres
+
+b_g <- train_set %>%
+  group_by(genres) %>%
+  summarise(b_g = mean(rating - mu)*(n()/(n() + 10.7)))
+
+#add regularized movie specific effect
+
+b_m <- train_set %>%
+  left_join(b_g, by = "genres") %>%
+  group_by(movieId) %>%
+  summarize(b_m = mean(rating - mu - b_g)*(n()/(n() + 4.4)))
+
+#add regularized user specific effect
+
+b_u <- train_set %>%
+  left_join(b_g, by = "genres") %>%
+  left_join(b_m, by = "movieId") %>%
+  group_by(userId) %>%
+  summarise(b_u = mean(rating - mu - b_g - b_m)*(n()/(n() + 4.3)))
+
+#cutpoints for time bins derived from whole movielens dataset (for use in time effects)
+#creates 20 bins
+
+cutpoints <- seq(min(edx$timestamp), max(edx$timestamp), length.out = 21)
+cutpoints[1] <- cutpoints[1]-1
+
+#add regularized movie-time effect to account for ratings changing 
+#through time for individual movies
+
+b_tm <- train_set %>% 
+  mutate(tbin = cut(timestamp, breaks = cutpoints, labels = FALSE)) %>%
+  left_join(b_m, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  group_by(movieId) %>%
+  group_by(tbin, add = TRUE) %>%
+  summarize(b_tm = mean(rating - mu - b_g - b_m - b_u)*(n()/(n() + 51)))
+
+#add regularized user-time effect to account for ratings changing 
+#through time for individual users
+
+b_tu <- train_set %>% 
+  mutate(tbin = cut(timestamp, breaks = cutpoints, labels = FALSE)) %>%
+  left_join(b_m, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  left_join(b_tm, by = c("tbin", "movieId")) %>%
+  group_by(userId) %>%
+  group_by(tbin, add = TRUE) %>%
+  summarize(b_tu = mean(rating - mu - b_g - b_m - b_u - b_tm)*(n()/(n() + 19)))
+```
+
+```{r results, echo=FALSE}
+##RMSE function
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+
+results <- data.frame(Method = c("median", "mean (mu)"), 
+                      RMSE = c(RMSE(test_set$rating, 
+                                    median(train_set$rating)), 
+                               RMSE(test_set$rating, 
+                                    mean(train_set$rating))))
+
+test_pred <- 
+  test_set %>%
+  left_join(b_g, by = "genres") %>%
+  mutate(pred = mu + b_g,
+         pred_round = case_when(pred <= .5 ~ .5001, 
+                                pred > 5 ~ 5, 
+                                TRUE ~ pred))
+
+results <- bind_rows(results, 
+                     data.frame(Method = "mu + b_g", 
+                                RMSE = RMSE(test_set$rating, 
+                                            test_pred$pred_round)))
+
+test_pred <- 
+  test_set %>%
+  left_join(b_g, by = "genres") %>%
+  left_join(b_m, by = "movieId") %>%
+  mutate(pred = mu + b_g + b_m,
+         pred_round = case_when(pred <= .5 ~ .5001, 
+                                pred > 5 ~ 5, 
+                                TRUE ~ pred)) 
+
+results <- bind_rows(results, 
+                     data.frame(Method = "mu + b_g + b_m", 
+                                RMSE = RMSE(test_set$rating, 
+                                            test_pred$pred_round)))
+
+test_pred <- 
+  test_set %>%
+  left_join(b_m, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  mutate(pred = mu + b_g + b_m + b_u,
+         pred_round = case_when(pred <= .5 ~ .5001, 
+                                pred > 5 ~ 5, 
+                                TRUE ~ pred))
+
+results <- bind_rows(results, 
+                     data.frame(Method = "mu + b_g + b_m + b_v", 
+                                RMSE = RMSE(test_set$rating, 
+                                            test_pred$pred_round)))
+
+test_pred <- 
+  test_set %>%
+  mutate(tbin = cut(timestamp, breaks = cutpoints, labels = FALSE)) %>%
+  left_join(b_m, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  left_join(b_tm, by = c("tbin", "movieId")) %>%
+  mutate(b_tm = if_else(is.na(b_tm) ,0, b_tm),
+         pred = mu + b_g + b_m + b_u + b_tm,
+         pred_round = case_when(pred <= .5 ~ .5001, 
+                                pred > 5 ~ 5, 
+                                TRUE ~ pred))
+
+results <- bind_rows(results, 
+                     data.frame(Method = "mu + b_g + b_m + b_v + b_tm", 
+                                RMSE = RMSE(test_set$rating, 
+                                            test_pred$pred_round)))
+
+test_pred <- 
+  test_set %>%
+  mutate(tbin = cut(timestamp, breaks = cutpoints, labels = FALSE)) %>%
+  left_join(b_m, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  left_join(b_tm, by = c("tbin", "movieId")) %>%
+  left_join(b_tu, by = c("tbin", "userId")) %>%
+  mutate(b_tm = if_else(is.na(b_tm) ,0, b_tm), 
+         b_tu = if_else(is.na(b_tu), 0, b_tu),
+         pred = mu + b_g + b_m + b_u + b_tm + b_tu,
+         pred_round = case_when(pred <= .5 ~ .5001, 
+                                pred > 5 ~ 5, 
+                                TRUE ~ pred))
+
+results <- bind_rows(results, 
+                     data.frame(Method = "full model", 
+                                RMSE = RMSE(test_set$rating, 
+                                            test_pred$pred_round)))
+```
+
+Step-wise results of the model, as trained to the the training set and tested against the test set, are presented in Table 1. 
+
+Because the distribution of ratings was somewhat skewed, both the mean and median ratings were considered as starting points for baseline predictions. The mean prediction resulted in a lower RMSE, and was used in all subsequent modeling. 
+
+Viewer effects ($b_{v}$) and movie effects ($b_{m}$) look to have a similar amount of explanatory power, reducing the RMSE by `r round(results$RMSE[4] - results$RMSE[5], 4)` and `r round(results$RMSE[3] - results$RMSE[4], 4)`, respectively. The genre effect ($b_{g}$) is weaker, reducing the RMSE by only `r round(results$RMSE[2] - results$RMSE[3], 4)`. In a way, $b_{g}$ and $b_{m}$ together define a more comprehensive movie effect, as genres are movie descriptors. In that sense, differences between movies are probably more important in predicting ratings than differences between viewers.
+
+As expected, temporal effects had only a small impact on the loss. Taken together, the movie and viewer temporal effects ($b_{m,Bin(t)}$ and $b_{v,Bin(t)}$) reduced the RMSE by `r round(results$RMSE[5] - results$RMSE[7], 4)`.
+
+```{r results_table, results="asis"}
+kable(results, digits = 4, caption = "Loss reduction due to individual terms in the regression algorithm. The full model includes terms for predicting the overall mean rating (mu), genre-specific effects (b_g), movie-specific effects (b_m), viewer-specific effects (b_v), temporal movie effects (b_tm), and temporal viewer effects (b_tv).")
+```
+
+
+When trained to the training set, the overall model was found to predict actual ratings with an RMSE of `r round(results$RMSE[7], 4)`. This may sound impressive, given that the winning algorithm in the Netflix Grand Prize achieved an RMSE of 0.8567. In truth, the MovieLens dataset used here is just inherently easier to make predictions for than the Netflix dataset used in the competition. The biggest difference between the two is that the MovieLens dataset only includes ratings by viewers who had rated at least 20 movies. This makes the viewer effect more powerful, and allows for predictions with greater accuracy. 
+
+Other algorithms based on the MovieLens 10M dataset are more in line with my results. For example, a user-based collaborative filtering algorithm using 1000 nearest neighbors (similar to my model, but with the addition of a term to model viewer preferences) achieves an RMSE of 0.832.^[See Stefan Nikolic's 2017 article, "Improved R Implementation of Collaborative Filtering", available at: https://dzone.com/articles/improved-r-implementation-of-collaborative-filteri] Clearly there are gains to be made by considering viewer-movie interactions.
+
+```{r retrain, echo=FALSE}
+#start with naive assumption (guess the mean)
+
+mu <- mean(edx$rating)
+
+#add regularized genre specific effect with concatinated genres 
+#(regularization parameters determined previously)
+
+b_g <- edx %>%
+  group_by(genres) %>%
+  summarise(b_g = mean(rating - mu)*(n()/(n() + 10.7)))
+
+#add regularized movie specific effect
+
+b_m <- edx %>%
+  left_join(b_g, by = "genres") %>%
+  group_by(movieId) %>%
+  summarize(b_m = mean(rating - mu - b_g)*(n()/(n() + 4.4)))
+
+#add regularized user specific effect
+
+b_u <- edx %>%
+  left_join(b_g, by = "genres") %>%
+  left_join(b_m, by = "movieId") %>%
+  group_by(userId) %>%
+  summarise(b_u = mean(rating - mu - b_g - b_m)*(n()/(n() + 4.3)))
+
+#cutpoints for time bins derived from whole movielens dataset (for use in time effects)
+#creates 20 bins
+
+cutpoints <- seq(min(edx$timestamp), max(edx$timestamp), length.out = 21)
+cutpoints[1] <- cutpoints[1]-1
+
+#add regularized movie-time effect to account for ratings changing 
+#through time for individual movies
+
+b_tm <- edx %>% 
+  mutate(tbin = cut(timestamp, breaks = cutpoints, labels = FALSE)) %>%
+  left_join(b_m, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  group_by(movieId) %>%
+  group_by(tbin, add = TRUE) %>%
+  summarize(b_tm = mean(rating - mu - b_g - b_m - b_u)*(n()/(n() + 51)))
+
+#add regularized user-time effect to account for ratings changing 
+#through time for individual users
+
+b_tu <- edx %>% 
+  mutate(tbin = cut(timestamp, breaks = cutpoints, labels = FALSE)) %>%
+  left_join(b_m, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  left_join(b_tm, by = c("tbin", "movieId")) %>%
+  group_by(userId) %>%
+  group_by(tbin, add = TRUE) %>%
+  summarize(b_tu = mean(rating - mu - b_g - b_m - b_u - b_tm)*(n()/(n() + 19)))
+```
+
+```{r predict, echo=FALSE}
+test_pred <- 
+  validation %>%
+  mutate(tbin = cut(timestamp, breaks = cutpoints, labels = FALSE)) %>%
+  left_join(b_m, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  left_join(b_g, by = "genres") %>%
+  left_join(b_tm, by = c("tbin", "movieId")) %>%
+  left_join(b_tu, by = c("tbin", "userId")) %>%
+  mutate(b_tm = if_else(is.na(b_tm) ,0, b_tm), 
+         b_tu = if_else(is.na(b_tu), 0, b_tu),
+         pred = mu + b_g + b_m + b_u + b_tm + b_tu,
+         pred_round = case_when(pred <= .5 ~ .5001, 
+                                pred > 5 ~ 5, 
+                                TRUE ~ pred))
+```
+
+As a final step, I retrained my full model is to the entire working dataset to further improve its accuracy. In most machine learning tasks, there would be no way to evaluate the final gains made by such a retraining, but in this case a validation dataset was set aside by the HarvardX script to evaluate students' algorithms. When tested on the validation set, my trained model achieved a final RMSE of **`r round(RMSE(test_pred$rating, test_pred$pred_round), 4)`**. This is only a very minor improvement over the algorithm that was trained on the training set alone, and it seems that the estimate of accuracy obtained from the test set was quite good.
+
+#Conclusion
+
+Astute readers may ask why I would write a movie recommendation algorithm using a dated subset of the MovieLens collection, when an up-to-date, customizable recommendation system that uses the whole collection and was created by experts is already available for free.^[https://movielens.org] In answer I would say that we must not resign ourselves to that which our more knowledgeable forefathers left us, but must instead strive to replace their systems with the less nuanced work of our own hands. 
+
+May this model be a compass to guide you through the universe of real and imagined story-lines, and may you find worlds that, in your opinion, are above average.
